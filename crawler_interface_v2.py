@@ -7,7 +7,7 @@ from multiprocessing import cpu_count
 from concurrent.futures import ProcessPoolExecutor, wait
 
 
-class CrawlerInterface():
+class CrawlerInterfaceV2():
     """
     A class used to represent a Crawler Interface.
 
@@ -119,10 +119,60 @@ class CrawlerInterface():
             file.write(html_result["html"])
 
         return file_path
+    
+    async def __fetch_link(self, link, session):
+        """
+        Fetches the HTML content of a link.
 
-    async def __fetch(self, url, session):
+        Parameters
+        ----------
+        link : str
+            The link to fetch.
+
+        Returns
+        -------
+        dict
+            The result containing the link and its HTML content.
+        """
         if self.logger:
-            self.logger.info(f"Fetching {url}...")
+            self.logger.info(f"Fetching link: {link}...")
+
+        try:
+            async with session.get(link, **self.fetch_function_kwargs) as response:
+                status = response.status
+
+                if status != 200:
+                    if self.logger:
+                        self.logger.error(
+                            f"Failed to fetch link: {link} with status code {status} with reason {response.reason}"
+                        )
+                    return {"link": link, "html": ""}
+
+                html_body = await response.text()
+                return {"link": link, "html": html_body}
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to fetch link: {link} with error {e}")
+
+            return {"link": link, "html": ""}
+
+    async def __fetch_page(self, url, session):
+        """
+        Fetches the HTML content of a page and extracts 100 links.
+
+        Parameters
+        ----------
+        url : str
+            The URL to fetch.
+
+        Returns
+        -------
+        dict
+            The result containing the URL, its HTML content, and a list of link results.
+        """
+        if self.logger:
+            self.logger.info(f"Fetching page: {url}...")
 
         try:
             async with session.get(url, **self.fetch_function_kwargs) as response:
@@ -131,7 +181,7 @@ class CrawlerInterface():
                 if status != 200:
                     if self.logger:
                         self.logger.error(
-                            f"Fail to fetch {url} with status code {status} with reason {response.reason}"
+                            f"Failed to fetch page: {url} with status code {status} with reason {response.reason}"
                         )
                     return {}
 
@@ -146,105 +196,82 @@ class CrawlerInterface():
                         )
 
                     return {}
+                
+                links = [item["url"] for item in data]
 
-                if self.store_function:
-                    try:
-                        self.store_function(data, **self.store_function_kwargs)
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.error(
-                                f"Fail to store {url} with error {e}"
-                            )
+                # Fetch HTML content for each link concurrently
+                link_results = await asyncio.gather(
+                    *[self.__fetch_link(link, session) for link in links]
+                )
+
+                # Store HTML content locally
+                for link_result in link_results:
+                    if link_result["html"]:
+                        self.__store_html_locally(html_result=link_result)
 
                 return data
 
         except Exception as e:
             if self.logger:
-                self.logger.error(
-                    f"Fail to fetch {url} with error {e}"
-                )
+                self.logger.error(f"Failed to fetch page: {url} with error {e}")
 
             return {}
 
-    async def __bound_fetch(self, sem, url, session, *arg, **kwargs):
+    async def __bound_fetch_page(self, sem, url, session):
         # Getter function with semaphore.
         async with sem:
-            return await self.__fetch(
-                url,
-                session,
-                *arg,
-                **kwargs,
-            )
+            return await self.__fetch_page(url, session)
 
-    async def asynce_run(self, urls, *arg, **kwargs):
+    async def asynce_run_pages(self, urls):
         """
-        Runs the asynchronous tasks for the URLs.
+        Runs the asynchronous tasks for fetching pages.
 
         Parameters
         ----------
-            urls : list
-                The list of URLs to fetch.
+        urls : list
+            The list of URLs to fetch.
 
         Returns
         -------
-            list
-                The list of results from the parse function.
+        list
+            The list of results, each containing the URL, its HTML content, and link results.
         """
-
         tasks = []
-        # create instance of Semaphore
         sem = asyncio.Semaphore(self.max_concurrency)
 
-        # Create client session that will ensure we dont open new connection
-        # per each request.
         async with ClientSession() as session:
             for url in urls:
-                # pass Semaphore and session to every GET request
                 task = asyncio.ensure_future(
-                    self.__bound_fetch(
-                        sem,
-                        url,
-                        session,
-                        *arg,
-                        **kwargs
-                    )
+                    self.__bound_fetch_page(sem, url, session)
                 )
-
                 tasks.append(task)
 
             responses = await asyncio.gather(*tasks)
 
             return responses
 
-    def __asyncio_wrapper(self, urls):
-        return asyncio.run(self.asynce_run(urls))
-
-    def run(self, urls):
+    def run_pages(self, urls):
         """
-        Runs the crawler on the URLs. It uses a process pool executor to run the tasks in parallel.
+        Runs the crawler on the pages. It uses a process pool executor to run the tasks in parallel.
 
         Parameters
         ----------
-            urls : list
-                The list of URLs to fetch.
+        urls : list
+            The list of URLs to fetch.
 
         Returns
         -------
-            list
-                The list of results from the parse function.
+        list
+            The list of results, each containing the URL, its HTML content, and link results.
         """
-
         executor = ProcessPoolExecutor(max_workers=self.num_cores)
         tasks = [
             executor.submit(self.__asyncio_wrapper, pages_for_task)
             for pages_for_task in np.array_split(urls, self.num_cores)
         ]
 
-        doneTasks, _ = wait(tasks)
+        done_tasks, _ = wait(tasks)
 
-        results = [
-            task.result()
-            for task in doneTasks
-        ]
+        results = [task.result() for task in done_tasks]
 
         return sum(results, [])
