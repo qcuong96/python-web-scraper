@@ -10,18 +10,26 @@ class CrawlerInterface():
     def __init__(
         self,
         parse_html_function,
+        store_function= None,
         max_concurrency=10,
         num_cores=(cpu_count() - 1),
+        **store_function_kwargs
     ):
         self.num_cores = num_cores
         self.max_concurrency = max_concurrency
         self.parse_html_function = parse_html_function
-
+        self.store_function = store_function
+        self.store_function_kwargs = store_function_kwargs
     
     async def fetch(self, url, session, *arg, **kwargs):
         async with session.get(url, *arg, **kwargs) as response:
             html_body = await response.text()
-            return self.parse_html_function(html_body)
+            data = self.parse_html_function(html_body)
+
+            if self.store_function:
+                self.store_function(data, **self.store_function_kwargs)
+
+            return data
         
     async def bound_fetch(self, sem, url, session, *arg, **kwargs):
         # Getter function with semaphore.
