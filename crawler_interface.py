@@ -17,9 +17,9 @@ class CrawlerInterface():
         The number of cores to use for the crawler.
     max_concurrency : int
         The maximum number of concurrent requests.
-    parse_html_function : function
+    parse_html_function : callable
         The function to parse the HTML.
-    store_function : function, optional
+    store_function : callable, optional
         The function to store the parsed data.
     store_function_kwargs : dict, optional
         The keyword arguments for the store function.
@@ -40,10 +40,12 @@ class CrawlerInterface():
         Runs the crawler on the URLs. It uses a process pool executor to run the tasks in parallel.
     """
 
+    logger = None
+
     def __init__(
         self,
-        parse_html_function: function,
-        store_function: function = None,
+        parse_html_function: callable,
+        store_function: callable = None,
         max_concurrency: int = 10,
         num_cores: int = (cpu_count() - 1),
         store_function_kwargs: dict = {},
@@ -55,9 +57,9 @@ class CrawlerInterface():
 
         Parameters
         ----------
-            parse_html_function : function
+            parse_html_function : callable
                 The function to parse the HTML.
-            store_function : function, optional
+            store_function : callable, optional
                 The function to store the parsed data.
             max_concurrency : int, optional
                 The maximum number of concurrent requests.
@@ -81,23 +83,56 @@ class CrawlerInterface():
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-    async def fetch(self, url, session):
-        async with session.get(url, **self.fetch_function_kwargs) as response:
-            if response.status != 200:
-                return {}
+    async def __fetch(self, url, session):
+        if self.logger:
+            self.logger.info(f"Fetching {url}...")
 
-            html_body = await response.text()
-            data = self.parse_html_function(html_body)
+        try:
+            async with session.get(url, **self.fetch_function_kwargs) as response:
+                status = response.status
 
-            if self.store_function:
-                self.store_function(data, **self.store_function_kwargs)
+                if status != 200:
+                    if self.logger:
+                        self.logger.error(
+                            f"Fail to fetch {url} with status code {status} with reason {response.reason}"
+                        )
+                    return {}
 
-            return data
+                html_body = await response.text()
 
-    async def bound_fetch(self, sem, url, session, *arg, **kwargs):
+                try:
+                    data = self.parse_html_function(html_body)
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(
+                            f"Fail to parse {url} with error {e}"
+                        )
+
+                    return {}
+
+                if self.store_function:
+                    try:
+                        self.store_function(data, **self.store_function_kwargs)
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(
+                                f"Fail to store {url} with error {e}"
+                            )
+
+                return data
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"Fail to fetch {url} with error {e}"
+                )
+
+            return {}
+
+    async def __bound_fetch(self, sem, url, session, *arg, **kwargs):
         # Getter function with semaphore.
         async with sem:
-            return await self.fetch(
+            return await self.__fetch(
                 url,
                 session,
                 *arg,
@@ -105,6 +140,20 @@ class CrawlerInterface():
             )
 
     async def asynce_run(self, urls, *arg, **kwargs):
+        """
+        Runs the asynchronous tasks for the URLs.
+
+        Parameters
+        ----------
+            urls : list
+                The list of URLs to fetch.
+
+        Returns
+        -------
+            list
+                The list of results from the parse function.
+        """
+
         tasks = []
         # create instance of Semaphore
         sem = asyncio.Semaphore(self.max_concurrency)
@@ -115,7 +164,7 @@ class CrawlerInterface():
             for url in urls:
                 # pass Semaphore and session to every GET request
                 task = asyncio.ensure_future(
-                    self.bound_fetch(
+                    self.__bound_fetch(
                         sem,
                         url,
                         session,
@@ -130,13 +179,27 @@ class CrawlerInterface():
 
             return responses
 
-    def asyncio_wrapper(self, urls):
+    def __asyncio_wrapper(self, urls):
         return asyncio.run(self.asynce_run(urls))
 
     def run(self, urls):
+        """
+        Runs the crawler on the URLs. It uses a process pool executor to run the tasks in parallel.
+
+        Parameters
+        ----------
+            urls : list
+                The list of URLs to fetch.
+
+        Returns
+        -------
+            list
+                The list of results from the parse function.
+        """
+
         executor = ProcessPoolExecutor(max_workers=self.num_cores)
         tasks = [
-            executor.submit(self.asyncio_wrapper, pages_for_task)
+            executor.submit(self.__asyncio_wrapper, pages_for_task)
             for pages_for_task in np.array_split(urls, self.num_cores)
         ]
 
